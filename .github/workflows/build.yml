@@ -1,10 +1,11 @@
 # 在 GitHub 的 macOS 机器上把 iOS 外壳编一次（swiftc 直接编，不用 Xcode 工程），
 # 产物 shell-ios.zip 里是 arm64 可执行文件 + 编译信息。服务器拉下来后，每个服主出包只换 Info.plist / 图标 / shell.json。
+# 另编一份模拟器版，用服务器同样的 Info.plist 拼成 .app 装进模拟器启动，截图确认能跑起来、能加载游戏页。
 name: build-ios-shell
 on:
   workflow_dispatch:
   push:
-    paths: ['Shell.swift', '.github/workflows/build.yml']
+    paths: ['Shell.swift', 'Info.plist', '.github/workflows/build.yml']
 
 jobs:
   build:
@@ -40,3 +41,39 @@ jobs:
           name: shell-ios
           path: shell-ios.zip
           retention-days: 90
+
+      - name: 模拟器启动测试
+        if: hashFiles('Info.plist') != ''
+        run: |
+          set -euo pipefail
+          SIMSDK=$(xcrun --sdk iphonesimulator --show-sdk-path)
+          APP=sim/Shell.app
+          mkdir -p "$APP"
+          xcrun --sdk iphonesimulator swiftc -Onone \
+            -target arm64-apple-ios15.0-simulator -sdk "$SIMSDK" \
+            -parse-as-library -module-name Shell Shell.swift -o "$APP/Shell"
+          cp Info.plist shell.json "$APP/"
+          cp icon.png "$APP/AppIcon60x60@2x.png"
+          plutil -lint "$APP/Info.plist"
+          # 模拟器要求 Info.plist 里平台是模拟器
+          plutil -replace CFBundleSupportedPlatforms -json '["iPhoneSimulator"]' "$APP/Info.plist"
+          plutil -replace DTPlatformName -string iphonesimulator "$APP/Info.plist"
+          codesign -s - --force "$APP"
+          DEV=$(xcrun simctl list devices available -j | python3 -c "import json,sys;d=json.load(sys.stdin)['devices'];print(next(x['udid'] for k in sorted(d,reverse=True) if 'iOS' in k for x in d[k] if x['name'].startswith('iPhone')))")
+          echo "device $DEV"
+          xcrun simctl boot "$DEV"
+          xcrun simctl bootstatus "$DEV" -b
+          xcrun simctl install "$DEV" "$APP"
+          BID=$(plutil -extract CFBundleIdentifier raw "$APP/Info.plist")
+          xcrun simctl launch "$DEV" "$BID"
+          sleep 25
+          xcrun simctl spawn "$DEV" launchctl list | grep -i "$BID" && echo "进程在跑" || (echo "进程没起来"; exit 1)
+          xcrun simctl io "$DEV" screenshot shot.png
+          xcrun simctl spawn "$DEV" log show --last 2m --style compact --predicate "process == 'Shell'" | tail -40 || true
+
+      - uses: actions/upload-artifact@v4
+        if: always() && hashFiles('shot.png') != ''
+        with:
+          name: sim-shot
+          path: shot.png
+          retention-days: 14
