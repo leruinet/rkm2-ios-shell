@@ -1,0 +1,42 @@
+# 在 GitHub 的 macOS 机器上把 iOS 外壳编一次（swiftc 直接编，不用 Xcode 工程），
+# 产物 shell-ios.zip 里是 arm64 可执行文件 + 编译信息。服务器拉下来后，每个服主出包只换 Info.plist / 图标 / shell.json。
+name: build-ios-shell
+on:
+  workflow_dispatch:
+  push:
+    paths: ['Shell.swift', '.github/workflows/build.yml']
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 编译
+        run: |
+          set -euo pipefail
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          SDKVER=$(xcrun --sdk iphoneos --show-sdk-version)
+          XCV=$(xcodebuild -version | head -1 | awk '{print $2}')
+          XCB=$(xcodebuild -version | tail -1 | awk '{print $3}')
+          SDKB=$(xcrun --sdk iphoneos --show-sdk-build-version)
+          mkdir -p out
+          xcrun --sdk iphoneos swiftc -O -whole-module-optimization \
+            -target arm64-apple-ios15.0 -sdk "$SDK" \
+            -parse-as-library -module-name Shell \
+            Shell.swift -o out/Shell
+          xcrun strip -x out/Shell
+          lipo -info out/Shell
+          file out/Shell
+          cat > out/build.json <<EOF
+          {"sdk":"iphoneos$SDKVER","sdkVersion":"$SDKVER","sdkBuild":"$SDKB",
+           "xcode":"$XCV","xcodeBuild":"$XCB","minOS":"15.0","commit":"$GITHUB_SHA"}
+          EOF
+          cat out/build.json
+          cd out && zip -q ../shell-ios.zip Shell build.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shell-ios
+          path: shell-ios.zip
+          retention-days: 90
