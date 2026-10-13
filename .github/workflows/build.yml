@@ -18,8 +18,10 @@ jobs:
           set -euo pipefail
           SDK=$(xcrun --sdk iphoneos --show-sdk-path)
           SDKVER=$(xcrun --sdk iphoneos --show-sdk-version)
-          XCV=$(xcodebuild -version | head -1 | awk '{print $2}')
-          XCB=$(xcodebuild -version | tail -1 | awk '{print $3}')
+          # 先整段收下来再拆：直接 | head -1 会让 xcodebuild 写到断掉的管道上崩掉（runner 新版本，pipefail 下整步失败）
+          XV=$(xcodebuild -version)
+          XCV=$(echo "$XV" | head -1 | awk '{print $2}')
+          XCB=$(echo "$XV" | tail -1 | awk '{print $3}')
           SDKB=$(xcrun --sdk iphoneos --show-sdk-build-version)
           mkdir -p out
           xcrun --sdk iphoneos swiftc -O -whole-module-optimization \
