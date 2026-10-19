@@ -39,6 +39,7 @@ final class ShellViewController: UIViewController, WKNavigationDelegate, WKUIDel
     private let errorView = UIView()
     private var home: URL?
     private var agent = ""
+    private var gateKey = ""        // 打包密钥（见 setGateCookie）
     private var net: NetBridge!     // 给网页开 TCP（微端直连），见文件末尾
 
     override func viewDidLoad() {
@@ -47,7 +48,8 @@ final class ShellViewController: UIViewController, WKNavigationDelegate, WKUIDel
         loadConfig()
         createWeb()
         buildErrorView()
-        if let u = home { web.load(URLRequest(url: u)) } else { showError() }
+        // cookie 存储是异步的：写好再开页面，第一个请求就带上
+        if let u = home { setGateCookie { [weak self] in self?.web.load(URLRequest(url: u)) } } else { showError() }
         // 电量：WKWebView 没有 navigator.getBattery，壳推给网页 window.__rkmBattery（mobileui/hud.mjs 读）
         UIDevice.current.isBatteryMonitoringEnabled = true
         for n in [UIDevice.batteryLevelDidChangeNotification, UIDevice.batteryStateDidChangeNotification] {
@@ -76,6 +78,30 @@ final class ShellViewController: UIViewController, WKNavigationDelegate, WKUIDel
               let o = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any] else { return }
         if let s = o["url"] as? String { home = URL(string: s) }
         agent = (o["agent"] as? String) ?? ""
+        gateKey = Self.unmask((o["pk"] as? String) ?? "", (o["pm"] as? String) ?? "")
+    }
+
+    // 打包密钥：shell.json 里是「密钥 XOR 掩码」和掩码两段（appshell/packkey.mjs），异或回来
+    private static func unmask(_ pk: String, _ pm: String) -> String {
+        let a = Array(pk.utf8), b = Array(pm.utf8)
+        guard a.count == 64, b.count == 64 else { return "" }
+        func hx(_ c: UInt8) -> Int? { Int(String(UnicodeScalar(c)), radix: 16) }
+        var out = ""
+        for i in stride(from: 0, to: 64, by: 2) {
+            guard let a1 = hx(a[i]), let a2 = hx(a[i + 1]), let b1 = hx(b[i]), let b2 = hx(b[i + 1]) else { return "" }
+            out += String(format: "%02x", ((a1 << 4) | a2) ^ ((b1 << 4) | b2))
+        }
+        return out
+    }
+
+    // 服主没开网页访问时，站点只认带 __rkmkey cookie 的请求（App 外的浏览器拿不到）
+    private func setGateCookie(_ done: @escaping () -> Void) {
+        guard !gateKey.isEmpty, let u = home, let h = u.host else { done(); return }
+        var p: [HTTPCookiePropertyKey: Any] = [.name: "__rkmkey", .value: gateKey, .domain: h, .path: "/",
+                                               .maximumAge: "31536000"]
+        if u.scheme == "https" { p[.secure] = "TRUE" }
+        guard let c = HTTPCookie(properties: p) else { done(); return }
+        WKWebsiteDataStore.default().httpCookieStore.setCookie(c) { done() }
     }
 
     private func createWeb() {
@@ -108,6 +134,8 @@ final class ShellViewController: UIViewController, WKNavigationDelegate, WKUIDel
         cfg.userContentController.add(net, name: "rkmnet")
         cfg.userContentController.addUserScript(
             WKUserScript(source: "window.__rkmNetVer=1", injectionTime: .atDocumentStart, forMainFrameOnly: true))
+        // 游戏里的「退出」（大退）：网页问过、点了确定才 postMessage，真把 App 关掉（见文件末尾 AppBridge）
+        cfg.userContentController.add(AppBridge(homeHost: home?.host ?? ""), name: "rkmapp")
 
         let w = WKWebView(frame: view.bounds, configuration: cfg)
         w.autoresizingMask = [.flexibleWidth, .flexibleHeight]
@@ -238,6 +266,23 @@ final class ShellViewController: UIViewController, WKNavigationDelegate, WKUIDel
     override var preferredScreenEdgesDeferringSystemGestures: UIRectEdge { .all }
     override var supportedInterfaceOrientations: UIInterfaceOrientationMask { .landscape }
     override var preferredInterfaceOrientationForPresentation: UIInterfaceOrientation { .landscapeRight }
+}
+
+// 网页叫的「关 App」：webkit.messageHandlers.rkmapp.postMessage({ op: 'quit' })，只认壳自己打包的那个站点的主页面。
+// iOS 没有公开的「退出 App」：先像按了 Home 键那样退到桌面（suspend），再结束进程 ——
+// 直接 exit 看着像闪退。退到桌面以后再 exit，下次点图标是重新启动
+final class AppBridge: NSObject, WKScriptMessageHandler {
+    private let homeHost: String
+
+    init(homeHost: String) { self.homeHost = homeHost.lowercased() }
+
+    func userContentController(_ uc: WKUserContentController, didReceive m: WKScriptMessage) {
+        guard m.frameInfo.isMainFrame, !homeHost.isEmpty,
+              m.frameInfo.securityOrigin.host.lowercased() == homeHost,
+              let o = m.body as? [String: Any], (o["op"] as? String) == "quit" else { return }
+        UIControl().sendAction(#selector(URLSessionTask.suspend), to: UIApplication.shared, for: nil)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { exit(0) }
+    }
 }
 
 // 给网页开原生 TCP —— 微端直连用（网页里只能开 WebSocket，微端说的是自己那套 TCP 协议）。
