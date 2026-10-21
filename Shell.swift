@@ -557,8 +557,8 @@ final class NetBridge: NSObject, WKScriptMessageHandler {
 
 // 本机文件桥 —— 打包客户端读写本机补丁（LOCALRES.md §1，和 exe / 安卓壳同一套语义）。
 // 网页那边是 localfs.mjs：const r = await webkit.messageHandlers.rkmfs.postMessage({ op, path, offset, length, data, size, dir, from, to })
-// 直接拿到结果（stat 的对象 / null、read 的 base64 字符串、true、list 的数组）；出错是 { error: '...' }（正常结果里不会有 error 这个键）。
-// 消息里带了数字 id 的，另外再调一次 window.__rkmfsCb(id, 结果)（LOCALRES.md 写的回调形式；用 Promise 就别带 id，免得 16MB 的结果再拼进 JS 源码一遍）。
+// 应答 = { ok: true, r: 结果 } 或 { ok: false, err: '原因' }（localfs.mjs 文件头）；结果：stat 的对象 / null、read 的 base64 字符串、true、list 的数组。
+// 消息里带了数字 id 的回 window.__rkmfsCb(id, 应答)（localfs.mjs 用这个）；postMessage 返回的 Promise 也给同一个应答（不带 id 时用它）。
 // 根目录 ROOT = Application Support/game。路径相对 ROOT，正反斜杠都认；不许 ..、盘符、绝对路径、: * ? " < > | 和控制字符，最长 260。
 // 手机文件系统分大小写：每一级先找同名的，没有再按不分大小写找已有的。一次最多读 16MB。
 // 只认壳自己打包的那个站点的主页面（协议 + 主机 + 端口都对上）。文件操作在一条后台队列上按到达顺序做。
@@ -590,7 +590,7 @@ final class FsBridge: NSObject, WKScriptMessageHandlerWithReply {
 
     func userContentController(_ uc: WKUserContentController, didReceive m: WKScriptMessage,
                                replyHandler: @escaping (Any?, String?) -> Void) {
-        guard allowed(m), let o = m.body as? [String: Any] else { replyHandler(["error": "not allowed"], nil); return }
+        guard allowed(m), let o = m.body as? [String: Any] else { replyHandler(["ok": false, "err": "not allowed"], nil); return }
         let id = (o["id"] as? NSNumber)?.intValue
         q.async { [weak self] in
             guard let self = self else { return }
@@ -606,15 +606,18 @@ final class FsBridge: NSObject, WKScriptMessageHandlerWithReply {
     }
 
     private func handle(_ o: [String: Any]) -> Any {
-        do { return try op(o) }
-        catch let e as FsErr { return ["error": e.msg] }
+        do {
+            let r = try op(o)
+            return ["ok": true, "r": r]
+        }
+        catch let e as FsErr { return ["ok": false, "err": e.msg] }
         catch {
             let e = error as NSError
             if (e.domain == NSCocoaErrorDomain && (e.code == NSFileNoSuchFileError || e.code == NSFileReadNoSuchFileError))
-                || (e.domain == NSPOSIXErrorDomain && e.code == Int(ENOENT)) { return ["error": "not found"] }
+                || (e.domain == NSPOSIXErrorDomain && e.code == Int(ENOENT)) { return ["ok": false, "err": "not found"] }
             if (e.domain == NSCocoaErrorDomain && e.code == NSFileWriteOutOfSpaceError)
-                || (e.domain == NSPOSIXErrorDomain && e.code == Int(ENOSPC)) { return ["error": "disk full"] }
-            return ["error": "io error"]
+                || (e.domain == NSPOSIXErrorDomain && e.code == Int(ENOSPC)) { return ["ok": false, "err": "disk full"] }
+            return ["ok": false, "err": "io error"]
         }
     }
 
