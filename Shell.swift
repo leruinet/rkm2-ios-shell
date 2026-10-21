@@ -41,15 +41,26 @@ final class ShellViewController: UIViewController, WKNavigationDelegate, WKUIDel
     private var agent = ""
     private var gateKey = ""        // 打包密钥（见 setGateCookie）
     private var net: NetBridge!     // 给网页开 TCP（微端直连），见文件末尾
+    private var fs: FsBridge!       // 本机文件桥（读写本机补丁），见文件末尾
+    // 运行目录 ROOT = Application Support/game（私有、不进 iCloud 备份，LOCALRES.md §0）
+    private let gameRoot = ShellViewController.makeRoot()
+    // 包里的资源包 Shell.app/bundle/（appshell/bundle.mjs 打的：bundle.json、patch/**、mui/**）
+    private let bundleDir = Bundle.main.bundleURL.appendingPathComponent("bundle", isDirectory: true)
+    private var bundleInfo: [String: Any]?
+    private var muiHash = ""
+    private var installLabel: UILabel?
 
     override func viewDidLoad() {
         super.viewDidLoad()
         view.backgroundColor = .black
         loadConfig()
+        loadBundleInfo()
         createWeb()
         buildErrorView()
-        // cookie 存储是异步的：写好再开页面，第一个请求就带上
-        if let u = home { setGateCookie { [weak self] in self?.web.load(URLRequest(url: u)) } } else { showError() }
+        // 先把包里的补丁释放到 ROOT（第一次 / 补丁换了），再写 cookie 开页面（cookie 存储是异步的：写好再开，第一个请求就带上）
+        if let u = home {
+            prepareBundle { [weak self] in self?.setGateCookie { [weak self] in self?.web.load(URLRequest(url: u)) } }
+        } else { showError() }
         // 电量：WKWebView 没有 navigator.getBattery，壳推给网页 window.__rkmBattery（mobileui/hud.mjs 读）
         UIDevice.current.isBatteryMonitoringEnabled = true
         for n in [UIDevice.batteryLevelDidChangeNotification, UIDevice.batteryStateDidChangeNotification] {
@@ -79,6 +90,85 @@ final class ShellViewController: UIViewController, WKNavigationDelegate, WKUIDel
         if let s = o["url"] as? String { home = URL(string: s) }
         agent = (o["agent"] as? String) ?? ""
         gateKey = Self.unmask((o["pk"] as? String) ?? "", (o["pm"] as? String) ?? "")
+    }
+
+    static func makeRoot() -> URL {
+        let fm = FileManager.default
+        let base = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        var r = base.appendingPathComponent("game", isDirectory: true)
+        try? fm.createDirectory(at: r, withIntermediateDirectories: true)
+        var rv = URLResourceValues()
+        rv.isExcludedFromBackup = true
+        try? r.setResourceValues(rv)
+        return r
+    }
+
+    private func loadBundleInfo() {
+        guard let d = try? Data(contentsOf: bundleDir.appendingPathComponent("bundle.json")),
+              let o = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any] else { return }
+        bundleInfo = o
+        muiHash = ((o["muiHash"] as? String) ?? "").filter { $0.isHexDigit }
+    }
+
+    private func rootHash() -> String? {
+        guard let d = try? Data(contentsOf: gameRoot.appendingPathComponent(".rkm/bundle.json")),
+              let o = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any] else { return nil }
+        return o["patchHash"] as? String
+    }
+
+    /// 包里 bundle.json 的 patchHash 和 ROOT/.rkm/bundle.json 记的不一样（第一次 / 换了补丁）：把 bundle/patch/ 下的文件释放到 ROOT
+    /// （覆盖同名，不删多出来的 —— 那些是微端拉的），最后记 .rkm/bundle.json。手机界面不释放，走 rkmb://mui/（MuiSchemeHandler）
+    private func prepareBundle(_ then: @escaping () -> Void) {
+        guard let b = bundleInfo else { then(); return }
+        let want = (b["patchHash"] as? String) ?? ""
+        if want == rootHash() { then(); return }
+        let label = UILabel(frame: view.bounds)
+        label.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        label.backgroundColor = .black
+        label.textColor = .white
+        label.font = .systemFont(ofSize: 18)
+        label.textAlignment = .center
+        label.text = "第一次运行，正在释放游戏资源……"
+        view.addSubview(label)
+        installLabel = label
+        let files = (b["files"] as? [[String: Any]]) ?? []
+        let root = gameRoot, src = bundleDir.appendingPathComponent("patch", isDirectory: true)
+        let bj = bundleDir.appendingPathComponent("bundle.json")
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let fm = FileManager.default
+            let total = max(1, files.reduce(Int64(0)) { $0 + (($1["size"] as? NSNumber)?.int64Value ?? 0) })
+            var done: Int64 = 0, lastPct = -1
+            var err: String?
+            do {
+                for f in files {
+                    guard let p = f["p"] as? String else { continue }
+                    let dst = try FsBridge.resolve(root, p, false)   // 路径规矩和网页那边一样；已有的按不分大小写认
+                    try fm.createDirectory(at: dst.deletingLastPathComponent(), withIntermediateDirectories: true)
+                    let tmp = URL(fileURLWithPath: dst.path + ".rkmtmp")
+                    try? fm.removeItem(at: tmp)
+                    try fm.copyItem(at: src.appendingPathComponent(p), to: tmp)   // 同一个 APFS 卷上是克隆，不占时间也不占两份地方
+                    if fm.fileExists(atPath: dst.path) { try fm.removeItem(at: dst) }
+                    try fm.moveItem(at: tmp, to: dst)
+                    done += (f["size"] as? NSNumber)?.int64Value ?? 0
+                    let pct = Int(done * 100 / total)
+                    if pct != lastPct {
+                        lastPct = pct
+                        DispatchQueue.main.async { self?.installLabel?.text = "第一次运行，正在释放游戏资源……  \(pct)%" }
+                    }
+                }
+                let mark = root.appendingPathComponent(".rkm", isDirectory: true)
+                try fm.createDirectory(at: mark, withIntermediateDirectories: true)
+                try Data(contentsOf: bj).write(to: mark.appendingPathComponent("bundle.json"), options: .atomic)
+            } catch {
+                err = "\(error)"
+            }
+            DispatchQueue.main.async {
+                self?.installLabel?.removeFromSuperview()
+                self?.installLabel = nil
+                if let e = err { NSLog("rkm: 释放游戏资源失败 %@", e) }   // 失败了照样进游戏：缺的图微端会补
+                then()
+            }
+        }
     }
 
     // 打包密钥：shell.json 里是「密钥 XOR 掩码」和掩码两段（appshell/packkey.mjs），异或回来
@@ -139,6 +229,16 @@ final class ShellViewController: UIViewController, WKNavigationDelegate, WKUIDel
         // 网页认这个才走原生震动（haptic.mjs）：没有它（老壳）就是没震动，不报错
         cfg.userContentController.addUserScript(
             WKUserScript(source: "window.__rkmHaptic=1", injectionTime: .atDocumentStart, forMainFrameOnly: true))
+        // 本机文件桥（localfs.mjs）：await webkit.messageHandlers.rkmfs.postMessage({ op, ... })，见文件末尾 FsBridge
+        fs = FsBridge(root: gameRoot, home: home)
+        fs.muiHash = muiHash
+        cfg.userContentController.addScriptMessageHandler(fs, contentWorld: .page, name: "rkmfs")
+        // 包里的手机界面：rkmb://mui/ui/xxx.json、rkmb://mui/res/xxx.png（MuiSchemeHandler），页面看 __rkmMui.base 换地址
+        cfg.setURLSchemeHandler(MuiSchemeHandler(base: bundleDir.appendingPathComponent("mui", isDirectory: true),
+                                                 home: home, gateKey: gateKey), forURLScheme: "rkmb")
+        cfg.userContentController.addUserScript(WKUserScript(
+            source: "window.__rkmFsVer=1" + (muiHash.isEmpty ? "" : ";window.__rkmMui={base:'rkmb://mui/',hash:'\(muiHash)'}"),
+            injectionTime: .atDocumentStart, forMainFrameOnly: true))
 
         let w = WKWebView(frame: view.bounds, configuration: cfg)
         w.autoresizingMask = [.flexibleWidth, .flexibleHeight]
@@ -159,6 +259,7 @@ final class ShellViewController: UIViewController, WKNavigationDelegate, WKUIDel
         view.insertSubview(w, at: 0)
         web = w
         net.web = w
+        fs.web = w
     }
 
     // 不让双击 / 双指缩放
@@ -451,5 +552,271 @@ final class NetBridge: NSObject, WKScriptMessageHandler {
         if b[0] == 0xfe && (b[1] & 0xc0) == 0x80 { return false }                 // fe80::/10
         if (b[0] & 0xfe) == 0xfc { return false }                                  // fc00::/7
         return true
+    }
+}
+
+// 本机文件桥 —— 打包客户端读写本机补丁（LOCALRES.md §1，和 exe / 安卓壳同一套语义）。
+// 网页那边是 localfs.mjs：const r = await webkit.messageHandlers.rkmfs.postMessage({ op, path, offset, length, data, size, dir, from, to })
+// 直接拿到结果（stat 的对象 / null、read 的 base64 字符串、true、list 的数组）；出错是 { error: '...' }（正常结果里不会有 error 这个键）。
+// 消息里带了数字 id 的，另外再调一次 window.__rkmfsCb(id, 结果)（LOCALRES.md 写的回调形式；用 Promise 就别带 id，免得 16MB 的结果再拼进 JS 源码一遍）。
+// 根目录 ROOT = Application Support/game。路径相对 ROOT，正反斜杠都认；不许 ..、盘符、绝对路径、: * ? " < > | 和控制字符，最长 260。
+// 手机文件系统分大小写：每一级先找同名的，没有再按不分大小写找已有的。一次最多读 16MB。
+// 只认壳自己打包的那个站点的主页面（协议 + 主机 + 端口都对上）。文件操作在一条后台队列上按到达顺序做。
+struct FsErr: Error {
+    let msg: String
+    init(_ m: String) { msg = m }
+}
+
+final class FsBridge: NSObject, WKScriptMessageHandlerWithReply {
+    static let maxRead = 16 << 20
+    weak var web: WKWebView?
+    var muiHash = ""
+    private let root: URL
+    private let home: URL?
+    private let q = DispatchQueue(label: "rkmfs")
+
+    init(root: URL, home: URL?) {
+        self.root = root
+        self.home = home
+    }
+
+    private func allowed(_ m: WKScriptMessage) -> Bool {
+        guard m.frameInfo.isMainFrame, let h = home, let hh = h.host?.lowercased(), let hs = h.scheme?.lowercased() else { return false }
+        let o = m.frameInfo.securityOrigin
+        guard o.host.lowercased() == hh, o.protocol.lowercased() == hs else { return false }
+        let def = hs == "https" ? 443 : 80
+        return (o.port == 0 ? def : o.port) == (h.port ?? def)
+    }
+
+    func userContentController(_ uc: WKUserContentController, didReceive m: WKScriptMessage,
+                               replyHandler: @escaping (Any?, String?) -> Void) {
+        guard allowed(m), let o = m.body as? [String: Any] else { replyHandler(["error": "not allowed"], nil); return }
+        let id = (o["id"] as? NSNumber)?.intValue
+        q.async { [weak self] in
+            guard let self = self else { return }
+            let r = self.handle(o)
+            DispatchQueue.main.async {
+                replyHandler(r, nil)
+                if let id = id, let d = try? JSONSerialization.data(withJSONObject: r, options: .fragmentsAllowed),
+                   let s = String(data: d, encoding: .utf8) {
+                    self.web?.evaluateJavaScript("window.__rkmfsCb&&window.__rkmfsCb(\(id),\(s))", completionHandler: nil)
+                }
+            }
+        }
+    }
+
+    private func handle(_ o: [String: Any]) -> Any {
+        do { return try op(o) }
+        catch let e as FsErr { return ["error": e.msg] }
+        catch {
+            let e = error as NSError
+            if (e.domain == NSCocoaErrorDomain && (e.code == NSFileNoSuchFileError || e.code == NSFileReadNoSuchFileError))
+                || (e.domain == NSPOSIXErrorDomain && e.code == Int(ENOENT)) { return ["error": "not found"] }
+            if (e.domain == NSCocoaErrorDomain && e.code == NSFileWriteOutOfSpaceError)
+                || (e.domain == NSPOSIXErrorDomain && e.code == Int(ENOSPC)) { return ["error": "disk full"] }
+            return ["error": "io error"]
+        }
+    }
+
+    private static func str(_ o: [String: Any], _ k: String) throws -> String {
+        guard let s = o[k] as? String else { throw FsErr("bad path") }
+        return s
+    }
+
+    private static func num(_ o: [String: Any], _ k: String) -> Int64? { (o[k] as? NSNumber)?.int64Value }
+
+    private func op(_ o: [String: Any]) throws -> Any {
+        let fm = FileManager.default
+        switch o["op"] as? String ?? "" {
+        case "info":
+            let free = (try? root.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]))?
+                .volumeAvailableCapacityForImportantUsage ?? 0
+            var r: [String: Any] = ["root": root.path, "free": free, "version": 1, "maxRead": FsBridge.maxRead, "platform": "ios"]
+            r["mui"] = muiHash.isEmpty ? NSNull() : ["base": "rkmb://mui/", "hash": muiHash]
+            return r
+        case "stat":
+            let u = try FsBridge.resolve(root, FsBridge.str(o, "path"), false)
+            var isDir: ObjCBool = false
+            guard fm.fileExists(atPath: u.path, isDirectory: &isDir) else { return NSNull() }
+            let a = try fm.attributesOfItem(atPath: u.path)
+            let mt = ((a[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0) * 1000
+            var r: [String: Any] = ["size": isDir.boolValue ? 0 : ((a[.size] as? NSNumber)?.int64Value ?? 0), "mtime": Int64(mt)]
+            if isDir.boolValue { r["dir"] = true }
+            return r
+        case "read":
+            let u = try FsBridge.resolve(root, FsBridge.str(o, "path"), false)
+            let off = max(0, FsBridge.num(o, "offset") ?? 0)
+            var len = FsBridge.num(o, "length") ?? -1
+            if len < 0 || len > Int64(FsBridge.maxRead) { len = Int64(FsBridge.maxRead) }
+            let h = try FileHandle(forReadingFrom: u)
+            defer { try? h.close() }
+            let size = try h.seekToEnd()
+            if UInt64(off) >= size { return "" }
+            try h.seek(toOffset: UInt64(off))
+            let n = Int(min(UInt64(len), size - UInt64(off)))
+            return (try h.read(upToCount: n) ?? Data()).base64EncodedString()
+        case "write":
+            let u = try FsBridge.resolve(root, FsBridge.str(o, "path"), false)
+            if FsBridge.execExt(u.lastPathComponent) { throw FsErr("denied") }
+            let off = FsBridge.num(o, "offset") ?? 0
+            if off < -1 { throw FsErr("bad offset") }
+            let s = o["data"] as? String ?? ""
+            guard let d = s.isEmpty ? Data() : Data(base64Encoded: s, options: .ignoreUnknownCharacters) else { throw FsErr("bad data") }
+            try fm.createDirectory(at: u.deletingLastPathComponent(), withIntermediateDirectories: true)
+            if !fm.fileExists(atPath: u.path) && !fm.createFile(atPath: u.path, contents: nil) { throw FsErr("io error") }
+            let h = try FileHandle(forWritingTo: u)
+            defer { try? h.close() }
+            if off == -1 { _ = try h.seekToEnd() } else { try h.seek(toOffset: UInt64(off)) }
+            try h.write(contentsOf: d)
+            return true
+        case "truncate":
+            let u = try FsBridge.resolve(root, FsBridge.str(o, "path"), false)
+            if FsBridge.execExt(u.lastPathComponent) { throw FsErr("denied") }
+            guard let size = FsBridge.num(o, "size"), size >= 0 else { throw FsErr("bad size") }
+            var isDir: ObjCBool = false
+            guard fm.fileExists(atPath: u.path, isDirectory: &isDir), !isDir.boolValue else { throw FsErr("not found") }
+            let h = try FileHandle(forWritingTo: u)
+            defer { try? h.close() }
+            try h.truncate(atOffset: UInt64(size))
+            return true
+        case "list":
+            let d = try FsBridge.resolve(root, o["dir"] != nil ? FsBridge.str(o, "dir") : FsBridge.str(o, "path"), true)
+            let keys: [URLResourceKey] = [.isDirectoryKey, .fileSizeKey]
+            guard let items = try? fm.contentsOfDirectory(at: d, includingPropertiesForKeys: keys) else { return [Any]() }
+            return items.map { u -> [String: Any] in
+                let v = try? u.resourceValues(forKeys: Set(keys))
+                let dir = v?.isDirectory ?? false
+                return ["name": u.lastPathComponent, "dir": dir, "size": dir ? 0 : (v?.fileSize ?? 0)]
+            }
+        case "remove":
+            let u = try FsBridge.resolve(root, FsBridge.str(o, "path"), false)
+            if FsBridge.execExt(u.lastPathComponent) { throw FsErr("denied") }
+            var isDir: ObjCBool = false
+            guard fm.fileExists(atPath: u.path, isDirectory: &isDir) else { return true }
+            if isDir.boolValue { throw FsErr("is directory") }
+            try fm.removeItem(at: u)
+            return true
+        case "rename":
+            let a = try FsBridge.resolve(root, FsBridge.str(o, "from"), false)
+            let b = try FsBridge.resolve(root, FsBridge.str(o, "to"), false)
+            if FsBridge.execExt(a.lastPathComponent) || FsBridge.execExt(b.lastPathComponent) { throw FsErr("denied") }
+            guard fm.fileExists(atPath: a.path) else { throw FsErr("not found") }
+            if a.path == b.path { return true }
+            try fm.createDirectory(at: b.deletingLastPathComponent(), withIntermediateDirectories: true)
+            if fm.fileExists(atPath: b.path) { try fm.removeItem(at: b) }   // 覆盖目标
+            try fm.moveItem(at: a, to: b)
+            return true
+        default:
+            throw FsErr("bad op")
+        }
+    }
+
+    // 一段路径里不许的：空、. / ..、结尾是点或空格、设备名（和 exe 壳一样，免得同一套补丁换个平台就不认）
+    static func badSeg(_ s: String) -> Bool {
+        if s.isEmpty || s == "." || s == ".." { return true }
+        if s.hasSuffix(".") || s.hasSuffix(" ") { return true }
+        let base = (s.split(separator: ".", maxSplits: 1, omittingEmptySubsequences: false).first.map(String.init) ?? s).uppercased()
+        if ["CON", "PRN", "AUX", "NUL"].contains(base) { return true }
+        if base.count == 4 && (base.hasPrefix("COM") || base.hasPrefix("LPT")),
+           let c = base.unicodeScalars.last, c.value >= 48 && c.value <= 57 { return true }
+        return false
+    }
+
+    /// 相对路径拆成一段段（不合法抛 bad path）；空：allowRoot 时给空数组（= ROOT 本身）
+    static func segs(_ rel: String, _ allowRoot: Bool) throws -> [String] {
+        guard rel.utf16.count <= 260 else { throw FsErr("bad path") }
+        let bad = Set("<>:\"|?*".unicodeScalars)
+        for c in rel.unicodeScalars where c.value < 32 || bad.contains(c) { throw FsErr("bad path") }
+        var s = rel.replacingOccurrences(of: "\\", with: "/")
+        if s.hasSuffix("/") { s.removeLast() }
+        if s.hasPrefix("/") { throw FsErr("bad path") }
+        if s.isEmpty {
+            if allowRoot { return [] }
+            throw FsErr("bad path")
+        }
+        let parts = s.components(separatedBy: "/")
+        for p in parts where badSeg(p) { throw FsErr("bad path") }
+        return parts
+    }
+
+    /// 相对路径 → ROOT 下的文件。每一级先认同名的，没有再不分大小写找已有的；都没有就照给的名字（新建用）
+    static func resolve(_ root: URL, _ rel: String, _ allowRoot: Bool) throws -> URL {
+        let fm = FileManager.default
+        var cur = root
+        var exists = true
+        for p in try segs(rel, allowRoot) {
+            var next = cur.appendingPathComponent(p)
+            if exists && !fm.fileExists(atPath: next.path) {
+                if let m = (try? fm.contentsOfDirectory(atPath: cur.path))?
+                    .first(where: { $0.caseInsensitiveCompare(p) == .orderedSame }) {
+                    next = cur.appendingPathComponent(m)
+                } else { exists = false }
+            }
+            cur = next
+        }
+        return cur
+    }
+
+    // 改动类操作不许碰可执行的东西（和 exe 壳同一张表）
+    static func execExt(_ name: String) -> Bool {
+        guard let d = name.lastIndex(of: ".") else { return false }
+        let e = name[name.index(after: d)...].lowercased()
+        return ["exe", "dll", "com", "bat", "cmd", "scr", "pif", "cpl", "msi", "lnk", "ps1", "vbs", "vbe",
+                "js", "jse", "wsf", "hta", "reg", "sys", "url"].contains(e)
+    }
+}
+
+// 包里的手机界面：rkmb://mui/ui/game.json、rkmb://mui/res/Game/x.png → Shell.app/bundle/mui/...；
+// 包里没有的到站点自己的 /mobileui/... 去拿（带打包密钥 cookie）。回的都带 Access-Control-Allow-Origin: *（页面是 http(s) 的，fetch 跨源）。
+// WKWebView 拦不了 http(s)，只能换个自定义协议 —— 页面看 window.__rkmMui.base（'rkmb://mui/'）换 uiBase / res。
+final class MuiSchemeHandler: NSObject, WKURLSchemeHandler {
+    private let base: URL
+    private let home: URL?
+    private let gateKey: String
+    private var live = Set<ObjectIdentifier>()   // 还没被 stop 的请求（stop 了再回会崩）
+
+    init(base: URL, home: URL?, gateKey: String) {
+        self.base = base
+        self.home = home
+        self.gateKey = gateKey
+    }
+
+    func webView(_ v: WKWebView, start t: WKURLSchemeTask) {
+        live.insert(ObjectIdentifier(t))
+        guard let u = t.request.url, u.host?.lowercased() == "mui" else { respond(t, 404, Data()); return }
+        let rel = String(u.path.drop(while: { $0 == "/" }))
+        guard rel.hasPrefix("ui/") || rel.hasPrefix("res/"), !rel.contains(".."), !rel.contains("//") else {
+            respond(t, 404, Data()); return
+        }
+        if let d = try? Data(contentsOf: base.appendingPathComponent(rel)) { respond(t, 200, d); return }
+        guard let h = home, var c = URLComponents(url: h, resolvingAgainstBaseURL: false) else { respond(t, 404, Data()); return }
+        c.path = "/mobileui/" + rel
+        c.query = nil
+        c.fragment = nil
+        guard let nu = c.url else { respond(t, 404, Data()); return }
+        var req = URLRequest(url: nu)
+        if !gateKey.isEmpty { req.setValue("__rkmkey=" + gateKey, forHTTPHeaderField: "Cookie") }
+        URLSession.shared.dataTask(with: req) { [weak self] data, resp, _ in
+            DispatchQueue.main.async {
+                let code = data == nil ? 502 : ((resp as? HTTPURLResponse)?.statusCode ?? 502)
+                self?.respond(t, code, data ?? Data())
+            }
+        }.resume()
+    }
+
+    func webView(_ v: WKWebView, stop t: WKURLSchemeTask) { live.remove(ObjectIdentifier(t)) }
+
+    private func respond(_ t: WKURLSchemeTask, _ code: Int, _ d: Data) {
+        guard live.remove(ObjectIdentifier(t)) != nil, let u = t.request.url else { return }
+        let ext = u.pathExtension.lowercased()
+        let mime = ["json": "application/json; charset=utf-8", "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+                    "webp": "image/webp", "gif": "image/gif", "svg": "image/svg+xml", "mp3": "audio/mpeg", "ogg": "audio/ogg"][ext]
+            ?? "application/octet-stream"
+        guard let r = HTTPURLResponse(url: u, statusCode: code, httpVersion: "HTTP/1.1", headerFields: [
+            "Content-Type": mime, "Content-Length": String(d.count),
+            "Access-Control-Allow-Origin": "*", "Cache-Control": "no-cache"]) else { return }
+        t.didReceive(r)
+        t.didReceive(d)
+        t.didFinish()
     }
 }
