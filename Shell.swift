@@ -136,6 +136,9 @@ final class ShellViewController: UIViewController, WKNavigationDelegate, WKUIDel
             WKUserScript(source: "window.__rkmNetVer=1", injectionTime: .atDocumentStart, forMainFrameOnly: true))
         // 游戏里的「退出」（大退）：网页问过、点了确定才 postMessage，真把 App 关掉（见文件末尾 AppBridge）
         cfg.userContentController.add(AppBridge(homeHost: home?.host ?? ""), name: "rkmapp")
+        // 网页认这个才走原生震动（haptic.mjs）：没有它（老壳）就是没震动，不报错
+        cfg.userContentController.addUserScript(
+            WKUserScript(source: "window.__rkmHaptic=1", injectionTime: .atDocumentStart, forMainFrameOnly: true))
 
         let w = WKWebView(frame: view.bounds, configuration: cfg)
         w.autoresizingMask = [.flexibleWidth, .flexibleHeight]
@@ -269,6 +272,7 @@ final class ShellViewController: UIViewController, WKNavigationDelegate, WKUIDel
 }
 
 // 网页叫的「关 App」：webkit.messageHandlers.rkmapp.postMessage({ op: 'quit' })，只认壳自己打包的那个站点的主页面。
+// 震动：postMessage({ op: 'haptic', ms }) —— iOS 网页里没有 navigator.vibrate，壳替它震一下（轻 / 中 / 重三档按 ms 挑）。
 // iOS 没有公开的「退出 App」：先像按了 Home 键那样退到桌面（suspend），再结束进程 ——
 // 直接 exit 看着像闪退。退到桌面以后再 exit，下次点图标是重新启动
 final class AppBridge: NSObject, WKScriptMessageHandler {
@@ -279,7 +283,15 @@ final class AppBridge: NSObject, WKScriptMessageHandler {
     func userContentController(_ uc: WKUserContentController, didReceive m: WKScriptMessage) {
         guard m.frameInfo.isMainFrame, !homeHost.isEmpty,
               m.frameInfo.securityOrigin.host.lowercased() == homeHost,
-              let o = m.body as? [String: Any], (o["op"] as? String) == "quit" else { return }
+              let o = m.body as? [String: Any] else { return }
+        if (o["op"] as? String) == "haptic" {
+            let ms = (o["ms"] as? NSNumber)?.intValue ?? 10
+            let style: UIImpactFeedbackGenerator.FeedbackStyle = ms >= 25 ? .heavy : ms >= 15 ? .medium : .light
+            let g = UIImpactFeedbackGenerator(style: style)
+            g.impactOccurred()
+            return
+        }
+        guard (o["op"] as? String) == "quit" else { return }
         UIControl().sendAction(#selector(URLSessionTask.suspend), to: UIApplication.shared, for: nil)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { exit(0) }
     }
